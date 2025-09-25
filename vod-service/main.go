@@ -14,10 +14,9 @@ import (
 )
 
 func main() {
-	log.Println("Starting VOD Service...")
+	log.Println("Starting VOD Service with Auth integration...")
 
 	// Database connection
-	log.Println("Connecting to database...")
 	db, err := ConnectDB()
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
@@ -25,21 +24,23 @@ func main() {
 	defer db.Close()
 
 	// Initialize storage
-	log.Println("Initializing MinIO storage...")
 	storage, err := NewStorage()
 	if err != nil {
 		log.Fatal("Failed to initialize storage:", err)
 	}
 
-	log.Println("Testing MinIO connection...")
 	if err := storage.TestConnection(); err != nil {
 		log.Fatal("MinIO connection test failed:", err)
 	}
 
+	// Initialize auth client
+	authClient := NewAuthClient()
+
 	// Create handlers
 	h := &Handlers{
-		db:      db,
-		storage: storage,
+		db:         db,
+		storage:    storage,
+		authClient: authClient, // ✅ ДОБАВЛЕНО
 	}
 
 	// Setup router
@@ -52,17 +53,25 @@ func main() {
 		AllowCredentials: true,
 	})
 
-	// Публичные маршруты (без авторизации)
+	// ===================================
+	// ПУБЛИЧНЫЕ ENDPOINTS (БЕЗ АВТОРИЗАЦИИ)
+	// ===================================
 	public := r.PathPrefix("/api/v1").Subrouter()
 	public.HandleFunc("/recordings", h.ListRecordings).Methods("GET")
 	public.HandleFunc("/recordings/{streamId}", h.GetRecording).Methods("GET")
 	public.HandleFunc("/recordings/{streamId}/stream", h.GetStreamURL).Methods("GET")
 	public.HandleFunc("/recordings/{streamId}/thumbnail", h.GetThumbnailURL).Methods("GET")
 
-	// Защищенные маршруты (требуют авторизации)
+	// ===================================
+	// ЗАЩИЩЕННЫЕ ENDPOINTS (ТРЕБУЮТ АВТОРИЗАЦИИ)
+	// ===================================
 	protected := r.PathPrefix("/api/v1").Subrouter()
-	protected.HandleFunc("/recordings", h.CreateRecording).Methods("POST")
+	protected.Use(authClient.AuthMiddleware) // ✅ Все protected endpoints требуют токен
+
+	// Обновление записей - только admin и streamer (только свои записи)
 	protected.HandleFunc("/recordings/{streamId}", h.UpdateRecording).Methods("PUT")
+
+	// Удаление записей - только admin и streamer (только свои записи)
 	protected.HandleFunc("/recordings/{streamId}", h.DeleteRecording).Methods("DELETE")
 
 	// Health check
@@ -78,14 +87,16 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("✅ VOD Service starting on port %s", port)
-		log.Printf("📋 Available endpoints:")
-		log.Printf("  GET  /api/v1/recordings")
-		log.Printf("  POST /api/v1/recordings (protected)")
-		log.Printf("  GET  /api/v1/recordings/{id}")
-		log.Printf("  PUT  /api/v1/recordings/{id} (protected)")
-		log.Printf("  DEL  /api/v1/recordings/{id} (protected)")
-		log.Printf("  GET  /health")
+		log.Printf("✅ VOD Service with Auth starting on port %s", port)
+		log.Printf("📋 Endpoints:")
+		log.Printf("  PUBLIC:")
+		log.Printf("    GET  /api/v1/recordings")
+		log.Printf("    GET  /api/v1/recordings/{id}")
+		log.Printf("  PROTECTED (require Bearer token):")
+		log.Printf("    POST /api/v1/recordings (admin, streamer only)")
+		log.Printf("    PUT  /api/v1/recordings/{id}")
+		log.Printf("    DEL  /api/v1/recordings/{id}")
+		log.Printf("  AUTH SERVICE: %s", getEnv("AUTH_SERVICE_URL", "http://localhost:8082"))
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal("Server failed to start:", err)

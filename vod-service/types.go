@@ -8,8 +8,9 @@ import (
 
 // Handlers структура для обработчиков
 type Handlers struct {
-	db      *pgxpool.Pool
-	storage *Storage
+	db         *pgxpool.Pool
+	storage    *Storage
+	authClient *AuthClient // ✅ ДОБАВЛЕНО
 }
 
 type Recording struct {

@@ -201,12 +201,17 @@ services:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin123
       - MINIO_BUCKET=recordings
+      # ✅ НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ AUTH ИНТЕГРАЦИИ
+      - AUTH_SERVICE_URL=http://auth-service:8082
+      - SERVICE_API_KEY=dev-service-api-key-for-local-testing
     networks:
       - app-network
     depends_on:
       recording-postgres:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      auth-service:           # ✅ ДОБАВЛЕНА ЗАВИСИМОСТЬ от auth-service
         condition: service_healthy
     restart: unless-stopped
 

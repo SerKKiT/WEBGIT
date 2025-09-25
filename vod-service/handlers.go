@@ -1,11 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -250,60 +250,24 @@ func (h *Handlers) GetThumbnailURL(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handlers) CreateRecording(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		StreamID      string  `json:"stream_id"`
-		Title         *string `json:"title,omitempty"`
-		Duration      *int    `json:"duration_seconds,omitempty"`
-		FilePath      *string `json:"file_path,omitempty"`
-		ThumbnailPath *string `json:"thumbnail_path,omitempty"`
-		FileSize      *int64  `json:"file_size_bytes,omitempty"`
-		Status        string  `json:"status"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, NewValidationError("Invalid JSON body"))
-		return
-	}
-
-	if req.StreamID == "" {
-		h.respondError(w, NewValidationError("stream_id is required"))
-		return
-	}
-
-	query := `
-        INSERT INTO recordings (stream_id, user_id, title, duration_seconds, file_path, thumbnail_path, file_size_bytes, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, created_at, updated_at`
-
-	var id int
-	var createdAt, updatedAt time.Time
-
-	err := h.db.QueryRow(r.Context(), query,
-		req.StreamID, nil, req.Title, req.Duration,
-		req.FilePath, req.ThumbnailPath, req.FileSize, req.Status).
-		Scan(&id, &createdAt, &updatedAt)
-
-	if err != nil {
-		if strings.Contains(err.Error(), "duplicate") {
-			h.respondError(w, APIError{Code: 409, Message: "Recording already exists", Details: "Stream ID already exists"})
-			return
-		}
-		h.handleError(w, fmt.Errorf("failed to create recording: %w", err))
-		return
-	}
-
-	h.respondJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":         id,
-		"stream_id":  req.StreamID,
-		"user_id":    nil,
-		"created_at": createdAt,
-		"message":    "Recording created successfully (no auth required)",
-	})
-}
-
+// ✅ ОБНОВЛЕННЫЙ UpdateRecording с проверкой владельца
 func (h *Handlers) UpdateRecording(w http.ResponseWriter, r *http.Request) {
 	streamID := mux.Vars(r)["streamId"]
+	claims, ok := r.Context().Value("user").(*AuthClaims)
+	if !ok {
+		h.respondError(w, NewInternalError("User context not found"))
+		return
+	}
+
+	// Проверяем, может ли пользователь редактировать эту запись
+	if !h.canModifyRecording(r.Context(), streamID, claims) {
+		h.respondError(w, APIError{
+			Code:    403,
+			Message: "Forbidden",
+			Details: "You can only modify your own recordings (unless you're an admin)",
+		})
+		return
+	}
 
 	var req UpdateRecordingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -328,13 +292,31 @@ func (h *Handlers) UpdateRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, map[string]string{
-		"message": "Recording updated successfully (no auth required)",
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":    "Recording updated successfully",
+		"updated_by": claims.Username,
+		"role":       claims.Role,
 	})
 }
 
+// ✅ ОБНОВЛЕННЫЙ DeleteRecording с проверкой владельца
 func (h *Handlers) DeleteRecording(w http.ResponseWriter, r *http.Request) {
 	streamID := mux.Vars(r)["streamId"]
+	claims, ok := r.Context().Value("user").(*AuthClaims)
+	if !ok {
+		h.respondError(w, NewInternalError("User context not found"))
+		return
+	}
+
+	// Проверяем, может ли пользователь удалить эту запись
+	if !h.canModifyRecording(r.Context(), streamID, claims) {
+		h.respondError(w, APIError{
+			Code:    403,
+			Message: "Forbidden",
+			Details: "You can only delete your own recordings (unless you're an admin)",
+		})
+		return
+	}
 
 	result, err := h.db.Exec(r.Context(), "DELETE FROM recordings WHERE stream_id = $1", streamID)
 	if err != nil {
@@ -347,7 +329,28 @@ func (h *Handlers) DeleteRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, map[string]string{
-		"message": "Recording deleted successfully (no auth required)",
+	h.respondJSON(w, http.StatusOK, map[string]interface{}{
+		"message":    "Recording deleted successfully",
+		"deleted_by": claims.Username,
+		"role":       claims.Role,
 	})
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: проверка прав на модификацию записи
+func (h *Handlers) canModifyRecording(ctx context.Context, streamID string, claims *AuthClaims) bool {
+	// Admin может модифицировать любые записи
+	if claims.Role == "admin" {
+		return true
+	}
+
+	// Для остальных - проверяем владельца записи
+	var ownerID int
+	query := `SELECT user_id FROM recordings WHERE stream_id = $1`
+	err := h.db.QueryRow(ctx, query, streamID).Scan(&ownerID)
+	if err != nil {
+		return false // Запись не найдена
+	}
+
+	// Пользователь может модифицировать только свои записи
+	return ownerID == claims.UserID
 }
