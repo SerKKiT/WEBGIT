@@ -16,6 +16,10 @@ type StreamNotification struct {
 	StreamID string `json:"stream_id"`
 	Status   string `json:"status"`
 	TaskID   int    `json:"task_id,omitempty"`
+	// ✅ ДОБАВЛЯЕМ ПОЛЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ (от main-app)
+	UserID   int    `json:"user_id,omitempty"`
+	Username string `json:"username,omitempty"`
+	Title    string `json:"title,omitempty"`
 }
 
 type StreamInfo struct {
@@ -24,7 +28,11 @@ type StreamInfo struct {
 	Port      int       `json:"port"`
 	SRTAddr   string    `json:"srt_addr"`
 	HLSPath   string    `json:"hls_path"`
-	StartTime time.Time `json:"start_time"` // Добавлено для точного времени
+	StartTime time.Time `json:"start_time"`
+	// ✅ ДОБАВЛЯЕМ ПОЛЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ
+	UserID   int    `json:"user_id,omitempty"`
+	Username string `json:"username,omitempty"`
+	Title    string `json:"title,omitempty"`
 }
 
 var (
@@ -56,7 +64,7 @@ func streamNotifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch notification.Status {
 	case "waiting":
-		handleWaitingStatus(notification.StreamID)
+		handleWaitingStatus(notification)
 	case "stopped", "error":
 		handleStopStatus(notification.StreamID)
 	}
@@ -65,7 +73,10 @@ func streamNotifyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "processed"})
 }
 
-func handleWaitingStatus(streamID string) {
+// ✅ ОБНОВЛЕННАЯ ФУНКЦИЯ: принимает полную информацию от main-app
+func handleWaitingStatus(notification StreamNotification) {
+	streamID := notification.StreamID
+
 	if stream, exists := activeStreams[streamID]; exists {
 		log.Printf("Stream %s already active on port %d", streamID, stream.Port)
 		return
@@ -85,26 +96,33 @@ func handleWaitingStatus(streamID string) {
 		return
 	}
 
+	// ✅ СОХРАНЯЕМ ИНФОРМАЦИЮ О ПОЛЬЗОВАТЕЛЕ ОТ MAIN-APP
 	activeStreams[streamID] = &StreamInfo{
 		StreamID:  streamID,
 		Status:    "waiting",
 		Port:      port,
 		SRTAddr:   srtAddr,
 		HLSPath:   fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
-		StartTime: time.Now(), // Фиксируем точное время старта
+		StartTime: time.Now(),
+		UserID:    notification.UserID,
+		Username:  notification.Username,
+		Title:     notification.Title,
 	}
 
+	// ✅ КРИТИЧЕСКИ ВАЖНО: ЗАПУСК HLS UPLOADER
 	startHLSUploader(streamID)
 
-	// ✅ ИСПРАВЛЕНО: Уведомить main-app что стрим "live"
+	// Уведомить main-app что стрим "live"
 	go func() {
-		time.Sleep(2 * time.Second) // Дать время FFmpeg запуститься
-		notifyMainAppStatusChange(streamID, "live")
+		time.Sleep(2 * time.Second)
+		notifyMainAppStatusChange(streamID, "running")
 	}()
 
-	log.Printf("Started stream %s on port %d with MinIO integration", streamID, port)
+	log.Printf("Started stream %s on port %d (user: %s, id: %d)",
+		streamID, port, notification.Username, notification.UserID)
 }
 
+// ✅ ИСПРАВЛЕННАЯ ФУНКЦИЯ handleStopStatus
 func handleStopStatus(streamID string) {
 	stream, exists := activeStreams[streamID]
 	if !exists {
@@ -118,11 +136,14 @@ func handleStopStatus(streamID string) {
 	// Освобождаем порт
 	releasePort(stream.Port)
 
-	// ✅ ЕДИНСТВЕННАЯ отправка в Kafka
+	// ✅ ИСПРАВЛЕНИЕ: получить информацию о пользователе из сохраненных данных или main-app
+	userID, username, title := getUserInfoFromStream(streamID, stream)
+
+	// ✅ ОТПРАВЛЯЕМ В KAFKA С ПРАВИЛЬНОЙ ИНФОРМАЦИЕЙ О ПОЛЬЗОВАТЕЛЕ
 	if kafkaProducer != nil {
 		go func() {
 			endTime := time.Now()
-			startTime := stream.StartTime // Используем точное время старта
+			startTime := stream.StartTime
 			if startTime.IsZero() {
 				startTime = endTime.Add(-60 * time.Second) // Fallback
 			}
@@ -130,6 +151,9 @@ func handleStopStatus(streamID string) {
 
 			recordingTask := kafka.RecordingTask{
 				StreamID:  streamID,
+				UserID:    userID,   // ✅ ПРАВИЛЬНЫЙ USER_ID
+				Username:  username, // ✅ ПРАВИЛЬНЫЙ USERNAME
+				Title:     title,    // ✅ ПРАВИЛЬНЫЙ TITLE
 				Action:    "stop_recording",
 				HLSPath:   fmt.Sprintf("/hls/%s/", streamID),
 				StartTime: startTime,
@@ -145,7 +169,8 @@ func handleStopStatus(streamID string) {
 			if err := kafkaProducer.SendRecordingTask(ctx, recordingTask); err != nil {
 				log.Printf("❌ Failed to send recording task: %v", err)
 			} else {
-				log.Printf("✅ Recording task sent for stream: %s (duration: %ds)", streamID, duration)
+				log.Printf("✅ Recording task sent for stream: %s (user_id: %d, username: %s, duration: %ds)",
+					streamID, userID, username, duration)
 			}
 		}()
 	}
@@ -153,7 +178,61 @@ func handleStopStatus(streamID string) {
 	// Удаляем из активных стримов (файлы остаются)
 	delete(activeStreams, streamID)
 
-	log.Printf("Stopped stream %s (files preserved, Kafka notified)", streamID)
+	log.Printf("Stopped stream %s (files preserved, Kafka notified with user info: %s/%d)",
+		streamID, username, userID)
+}
+
+// ✅ НОВАЯ УЛУЧШЕННАЯ ФУНКЦИЯ: получение информации о пользователе
+func getUserInfoFromStream(streamID string, stream *StreamInfo) (int, string, string) {
+	// 1. Сначала проверяем сохраненную информацию в StreamInfo
+	if stream.UserID > 0 && stream.Username != "" {
+		log.Printf("✅ Found user info from StreamInfo: %s (ID: %d)", stream.Username, stream.UserID)
+		return stream.UserID, stream.Username, stream.Title
+	}
+
+	// 2. Если нет сохраненной информации - запрашиваем у main-app
+	log.Printf("🔍 Requesting user info from main-app for stream: %s", streamID)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Запрос к main-app для получения информации о задаче по stream_id
+	url := fmt.Sprintf("http://main-app:8080/tasks?stream_id=%s", streamID)
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("⚠️ Failed to get task info from main-app: %v", err)
+		return 0, "unknown", fmt.Sprintf("Stream %s", streamID)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("⚠️ Main-app returned status %d for stream %s", resp.StatusCode, streamID)
+		return 0, "unknown", fmt.Sprintf("Stream %s", streamID)
+	}
+
+	var tasks []struct {
+		ID       int    `json:"id"`
+		StreamID string `json:"stream_id"`
+		Name     string `json:"name"`
+		UserID   int    `json:"user_id"`
+		Username string `json:"username"`
+		Status   string `json:"status"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
+		log.Printf("⚠️ Failed to decode main-app response: %v", err)
+		return 0, "unknown", fmt.Sprintf("Stream %s", streamID)
+	}
+
+	// Найти задачу по stream_id
+	for _, task := range tasks {
+		if task.StreamID == streamID {
+			log.Printf("✅ Found user info from main-app: %s (ID: %d)", task.Username, task.UserID)
+			return task.UserID, task.Username, task.Name
+		}
+	}
+
+	log.Printf("⚠️ Stream %s not found in main-app tasks", streamID)
+	return 0, "legacy", fmt.Sprintf("Legacy Stream %s", streamID)
 }
 
 func streamStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -187,9 +266,24 @@ func streamRecoveryHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func notifyMainAppStatusChange(streamID, status string) {
+	// ✅ ИСПРАВЛЕНИЕ: приводим статусы к валидным для main-app
+	var mainAppStatus string
+	switch status {
+	case "live":
+		mainAppStatus = "running" // ✅ "live" → "running"
+	case "waiting":
+		mainAppStatus = "waiting"
+	case "stopped":
+		mainAppStatus = "stopped"
+	case "error":
+		mainAppStatus = "error"
+	default:
+		mainAppStatus = "running" // Fallback
+	}
+
 	notification := map[string]interface{}{
 		"stream_id": streamID,
-		"status":    status,
+		"status":    mainAppStatus, // ✅ ИСПОЛЬЗУЕМ ВАЛИДНЫЙ СТАТУС
 	}
 
 	jsonData, err := json.Marshal(notification)
@@ -219,11 +313,12 @@ func notifyMainAppStatusChange(streamID, status string) {
 		return
 	}
 
-	log.Printf("Successfully notified main-app: stream %s status changed to %s", streamID, status)
+	log.Printf("Successfully notified main-app: stream %s status changed to %s (mapped from %s)",
+		streamID, mainAppStatus, status)
 
 	streamsMux.Lock()
 	if stream, exists := activeStreams[streamID]; exists {
-		stream.Status = status
+		stream.Status = status // Оставляем оригинальный статус в stream-app
 	}
 	streamsMux.Unlock()
 }

@@ -15,10 +15,10 @@ type Producer struct {
 	writer *kafka.Writer
 }
 
-// Структура задачи для обработки записи
 type RecordingTask struct {
 	StreamID     string    `json:"stream_id"`
-	UserID       int       `json:"user_id,omitempty"`
+	UserID       int       `json:"user_id"`  // ✅ ДОБАВЛЕНО
+	Username     string    `json:"username"` // ✅ ДОБАВЛЕНО
 	Title        string    `json:"title"`
 	Action       string    `json:"action"`   // "stop_recording", "start_recording"
 	HLSPath      string    `json:"hls_path"` // путь к HLS сегментам
@@ -70,6 +70,14 @@ func (p *Producer) SendRecordingTask(ctx context.Context, task RecordingTask) er
 		return fmt.Errorf("action is required")
 	}
 
+	// ✅ Логируем информацию о пользователе
+	if task.UserID > 0 {
+		log.Printf("📨 Sending recording task for authorized stream: %s (user: %s, id: %d)",
+			task.StreamID, task.Username, task.UserID)
+	} else {
+		log.Printf("📨 Sending recording task for legacy stream: %s", task.StreamID)
+	}
+
 	// Сериализовать в JSON
 	taskBytes, err := json.Marshal(task)
 	if err != nil {
@@ -84,6 +92,7 @@ func (p *Producer) SendRecordingTask(ctx context.Context, task RecordingTask) er
 		Headers: []kafka.Header{
 			{Key: "action", Value: []byte(task.Action)},
 			{Key: "source", Value: []byte("stream-app")},
+			{Key: "user_id", Value: []byte(fmt.Sprintf("%d", task.UserID))}, // ✅ ДОБАВЛЕНО
 		},
 	}
 
@@ -93,8 +102,8 @@ func (p *Producer) SendRecordingTask(ctx context.Context, task RecordingTask) er
 		return fmt.Errorf("failed to write to kafka: %w", err)
 	}
 
-	log.Printf("✅ Recording task sent: stream=%s, action=%s, duration=%ds",
-		task.StreamID, task.Action, task.Duration)
+	log.Printf("✅ Recording task sent: stream=%s, user=%s(%d), action=%s, duration=%ds",
+		task.StreamID, task.Username, task.UserID, task.Action, task.Duration)
 	return nil
 }
 

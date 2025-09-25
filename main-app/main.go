@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,10 +11,14 @@ import (
 
 	"web/main-app/database"
 
+	"github.com/gorilla/mux"
 	"github.com/jackc/pgx/v5"
 )
 
-var db *pgx.Conn
+var (
+	db         *pgx.Conn
+	authClient *AuthClient // ✅ ДОБАВЛЕНО
+)
 
 func connectDB() (*pgx.Conn, error) {
 	cfg := LoadDBConfig()
@@ -70,7 +75,13 @@ func runMigrations() error {
 }
 
 func setupRoutes() {
-	http.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+	// Создаем Gorilla Mux router
+	r := mux.NewRouter()
+
+	// ===================================
+	// LEGACY ENDPOINTS (БЕЗ АВТОРИЗАЦИИ) - для совместимости
+	// ===================================
+	r.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			GetTasksHandler(w, r)
@@ -83,24 +94,59 @@ func setupRoutes() {
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
+	}).Methods("GET", "POST", "PUT", "DELETE")
+
+	r.HandleFunc("/tasks/update_status_by_stream", UpdateTaskStatusByStreamHandler).Methods("PUT")
+	r.HandleFunc("/tasks/active", GetActiveTasksHandler).Methods("GET")
+
+	// ===================================
+	// ПУБЛИЧНЫЕ ENDPOINTS (БЕЗ АВТОРИЗАЦИИ)
+	// ===================================
+	api := r.PathPrefix("/api").Subrouter()
+
+	api.HandleFunc("/streams", PublicStreamsHandler).Methods("GET") // Список live стримов
+	api.HandleFunc("/health", HealthHandler).Methods("GET")         // Health check
+
+	// ===================================
+	// АВТОРИЗОВАННЫЕ ENDPOINTS
+	// ===================================
+	protected := api.PathPrefix("/streams").Subrouter()
+
+	// Middleware для всех защищенных endpoints
+	protected.Use(func(next http.Handler) http.Handler {
+		return authClient.AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+		})
 	})
 
-	http.HandleFunc("/tasks/update_status_by_stream", UpdateTaskStatusByStreamHandler)
-	http.HandleFunc("/tasks/active", GetActiveTasksHandler)
+	// Создание стримов - только streamer и admin
+	protected.Handle("", authClient.RequireStreamerRole(CreateStreamHandler)).Methods("POST")
 
-	// Добавляем endpoint для проверки миграций
-	http.HandleFunc("/debug/migrations", func(w http.ResponseWriter, r *http.Request) {
+	// Управление своими стримами
+	protected.HandleFunc("/{streamId}/start", StartStreamHandler).Methods("POST")
+	protected.HandleFunc("/{streamId}/stop", StopStreamHandler).Methods("POST")
+
+	// Список моих стримов
+	protected.HandleFunc("/my", MyStreamsHandler).Methods("GET")
+
+	// ===================================
+	// DEBUG ENDPOINTS
+	// ===================================
+	r.HandleFunc("/debug/migrations", func(w http.ResponseWriter, r *http.Request) {
 		if err := database.ShowMigrationStatus(db); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to get migration status: %v", err), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Migration status logged to console"))
-	})
+	}).Methods("GET")
+
+	// Используем Gorilla Mux вместо стандартного http
+	http.Handle("/", r)
 }
 
 func main() {
-	log.Println("🚀 Starting Main-App...")
+	log.Println("🚀 Starting Main-App with Auth integration...")
 
 	// Подключение к базе данных
 	var err error
@@ -109,6 +155,10 @@ func main() {
 		log.Fatalf("❌ Unable to connect to database: %v", err)
 	}
 	defer db.Close(context.Background())
+
+	// ✅ НОВОЕ: Инициализация Auth Client
+	authClient = NewAuthClient()
+	log.Println("✅ Auth client initialized successfully")
 
 	// Проверяем флаг для выполнения только миграций
 	if len(os.Args) > 1 && os.Args[1] == "--migrate-only" {
@@ -129,8 +179,49 @@ func main() {
 	setupRoutes()
 
 	// Запускаем сервер
-	log.Println("🌐 Main-app server starting on :8080")
+	log.Println("🌐 Main-app with Auth integration starting on :8080")
+	log.Printf("📋 Available endpoints:")
+	log.Printf("  LEGACY (no auth - for compatibility):")
+	log.Printf("    GET/POST/PUT/DEL /tasks")
+	log.Printf("    PUT  /tasks/update_status_by_stream")
+	log.Printf("    GET  /tasks/active")
+	log.Printf("  PUBLIC:")
+	log.Printf("    GET  /api/health")
+	log.Printf("    GET  /api/streams (live streams list)")
+	log.Printf("  PROTECTED (require Bearer token):")
+	log.Printf("    POST /api/streams (create stream - streamer/admin only)")
+	log.Printf("    POST /api/streams/{id}/start")
+	log.Printf("    POST /api/streams/{id}/stop")
+	log.Printf("    GET  /api/streams/my")
+	log.Printf("  AUTH SERVICE: %s", getEnv("AUTH_SERVICE_URL", "http://localhost:8082"))
+
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatalf("❌ HTTP server failed: %v", err)
 	}
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: Health check
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	// Проверяем подключение к БД
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var dbStatus string
+	if err := db.Ping(ctx); err != nil {
+		dbStatus = "disconnected"
+	} else {
+		dbStatus = "connected"
+	}
+
+	response := map[string]interface{}{
+		"status":           "healthy",
+		"service":          "main-app-with-auth",
+		"version":          "2.0.0",
+		"database":         dbStatus,
+		"auth_integration": true,
+		"timestamp":        time.Now(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

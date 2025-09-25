@@ -2,7 +2,10 @@ module web/main-app
 
 go 1.25.1
 
-require github.com/jackc/pgx/v5 v5.7.6
+require (
+	github.com/gorilla/mux v1.8.1
+	github.com/jackc/pgx/v5 v5.7.6
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

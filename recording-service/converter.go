@@ -270,3 +270,79 @@ func getFileSize(filePath string) (int64, error) {
 	}
 	return fileInfo.Size(), nil
 }
+
+// ✅ ДОБАВИТЬ В КОНЕЦ converter.go
+
+// Новая функция: конвертация с указанным tempDir
+func convertHLSToMP4WithTempDir(task RecordingTask, tempHLSDir string) ProcessingResult {
+	log.Printf("🔄 Starting HLS→MP4 conversion for: %s (HLS dir: %s)", task.StreamID, tempHLSDir)
+
+	// ✅ Получить путь к плейлисту из tempDir
+	hlsPlaylist, err := findHLSPlaylistInDir(tempHLSDir)
+	if err != nil {
+		return ProcessingResult{
+			Success: false,
+			Error:   fmt.Errorf("HLS playlist not found in %s: %w", tempHLSDir, err),
+		}
+	}
+
+	// Пути для выходных файлов
+	outputMP4 := fmt.Sprintf("/tmp/%s.mp4", task.StreamID)
+	outputThumb := fmt.Sprintf("/tmp/%s.jpg", task.StreamID)
+
+	// ✅ Конвертация (используем существующую логику)
+	if err := convertToMP4(hlsPlaylist, outputMP4); err != nil {
+		return ProcessingResult{
+			Success: false,
+			Error:   fmt.Errorf("MP4 conversion failed: %w", err),
+		}
+	}
+
+	// ✅ Генерация thumbnail
+	generateThumbnail(outputMP4, outputThumb)
+
+	// ✅ Получить размер файла
+	fileSize, err := getFileSize(outputMP4)
+	if err != nil {
+		return ProcessingResult{
+			Success: false,
+			Error:   fmt.Errorf("could not get file size: %w", err),
+		}
+	}
+
+	log.Printf("✅ Conversion completed: %s (size: %d bytes)", task.StreamID, fileSize)
+
+	return ProcessingResult{
+		Success:       true,
+		MP4Path:       outputMP4,
+		ThumbnailPath: outputThumb,
+		FileSize:      fileSize,
+		Error:         nil,
+	}
+}
+
+// ✅ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: поиск плейлиста в директории
+func findHLSPlaylistInDir(dir string) (string, error) {
+	// Сначала проверяем стандартное имя
+	standardPlaylist := filepath.Join(dir, "stream.m3u8")
+	if _, err := os.Stat(standardPlaylist); err == nil {
+		log.Printf("📋 Found standard playlist: stream.m3u8")
+		return standardPlaylist, nil
+	}
+
+	// Ищем любой .m3u8 файл
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".m3u8") {
+			playlistPath := filepath.Join(dir, file.Name())
+			log.Printf("📋 Found playlist: %s", file.Name())
+			return playlistPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("no .m3u8 playlist found in directory")
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,9 +15,9 @@ import (
 )
 
 type StorageManager struct {
-	client    *minio.Client
-	bucket    string
-	hlsBucket string // ✅ Bucket для HLS файлов
+	minioClient *minio.Client
+	bucketName  string
+	vodBucket   string
 }
 
 type VODPaths struct {
@@ -40,304 +41,293 @@ func NewStorageManager() (*StorageManager, error) {
 		secretKey = "minioadmin123"
 	}
 
-	bucket := os.Getenv("MINIO_BUCKET")
-	if bucket == "" {
-		bucket = "recordings"
-	}
-
-	// ✅ Добавить HLS bucket
-	hlsBucket := os.Getenv("MINIO_HLS_BUCKET")
-	if hlsBucket == "" {
-		hlsBucket = "hls-streams"
-	}
-
-	log.Printf("📁 Connecting to MinIO: %s, VOD bucket: %s, HLS bucket: %s", endpoint, bucket, hlsBucket)
-
-	// Инициализация MinIO клиента
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: false, // HTTP для локальной разработки
+		Secure: false,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize MinIO client: %w", err)
+		return nil, err
 	}
 
 	sm := &StorageManager{
-		client:    client,
-		bucket:    bucket,
-		hlsBucket: hlsBucket, // ✅ Инициализировать HLS bucket
+		minioClient: client,
+		bucketName:  "hls-streams", // Исходные HLS файлы
+		vodBucket:   "recordings",  // VOD файлы
 	}
 
-	// ✅ Создать оба buckets
-	if err := sm.ensureBucket(); err != nil {
-		return nil, fmt.Errorf("failed to ensure VOD bucket: %w", err)
-	}
-
-	if err := sm.ensureHLSBucket(); err != nil {
-		return nil, fmt.Errorf("failed to ensure HLS bucket: %w", err)
-	}
-
-	log.Println("✅ MinIO storage manager initialized")
 	return sm, nil
 }
 
-func (sm *StorageManager) ensureBucket() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	exists, err := sm.client.BucketExists(ctx, sm.bucket)
-	if err != nil {
-		return fmt.Errorf("failed to check bucket existence: %w", err)
-	}
-
-	if !exists {
-		log.Printf("📁 Creating VOD bucket: %s", sm.bucket)
-		if err := sm.client.MakeBucket(ctx, sm.bucket, minio.MakeBucketOptions{}); err != nil {
-			return fmt.Errorf("failed to create bucket: %w", err)
-		}
-		log.Printf("✅ Created VOD bucket: %s", sm.bucket)
-	}
-
-	return nil
-}
-
-// ✅ Новый метод для HLS bucket
-func (sm *StorageManager) ensureHLSBucket() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	exists, err := sm.client.BucketExists(ctx, sm.hlsBucket)
-	if err != nil {
-		return fmt.Errorf("failed to check HLS bucket existence: %w", err)
-	}
-
-	if !exists {
-		log.Printf("📁 Creating HLS bucket: %s", sm.hlsBucket)
-		if err := sm.client.MakeBucket(ctx, sm.hlsBucket, minio.MakeBucketOptions{}); err != nil {
-			return fmt.Errorf("failed to create HLS bucket: %w", err)
-		}
-		log.Printf("✅ Created HLS bucket: %s", sm.hlsBucket)
-	}
-
-	return nil
-}
-
-// ✅ Метод для скачивания HLS файлов из MinIO
+// ✅ ОРИГИНАЛЬНАЯ ФУНКЦИЯ (для обратной совместимости)
 func (sm *StorageManager) DownloadHLSFiles(streamID string) (string, error) {
-	log.Printf("📥 Downloading HLS files for stream: %s", streamID)
+	return sm.DownloadHLSFilesWithRetry(streamID, 1)
+}
 
-	// Создать временную папку для HLS файлов
-	tempDir := fmt.Sprintf("/tmp/hls_%s_%d", streamID, time.Now().Unix())
+// ✅ НОВАЯ ФУНКЦИЯ: скачивание с retry
+func (sm *StorageManager) DownloadHLSFilesWithRetry(streamID string, attempt int) (string, error) {
+	// Создаем уникальную временную директорию
+	tempDir := fmt.Sprintf("/tmp/hls_%s_%d_%d", streamID, attempt, time.Now().Unix())
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
+		return "", fmt.Errorf("failed to create temp dir: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	ctx := context.Background()
 
-	prefix := fmt.Sprintf("%s/", streamID)
-
-	// Список объектов в HLS bucket
-	objectCh := sm.client.ListObjects(ctx, sm.hlsBucket, minio.ListObjectsOptions{
-		Prefix:    prefix,
+	// Список объектов в папке стрима
+	objectCh := sm.minioClient.ListObjects(ctx, sm.bucketName, minio.ListObjectsOptions{
+		Prefix:    streamID + "/",
 		Recursive: true,
 	})
 
 	downloadCount := 0
-	playlistFound := false
 
 	for object := range objectCh {
 		if object.Err != nil {
-			return "", fmt.Errorf("error listing HLS objects: %w", object.Err)
-		}
-
-		// Определить локальный путь
-		relativePath := strings.TrimPrefix(object.Key, prefix)
-		if relativePath == "" {
-			continue // Пропустить папку
-		}
-
-		localPath := filepath.Join(tempDir, relativePath)
-
-		// Создать папки если нужно
-		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-			log.Printf("⚠️ Failed to create dir for %s: %v", localPath, err)
+			log.Printf("❌ Error listing objects: %v", object.Err)
 			continue
 		}
 
-		// Скачать файл
-		if err := sm.client.FGetObject(ctx, sm.hlsBucket, object.Key, localPath, minio.GetObjectOptions{}); err != nil {
-			log.Printf("⚠️ Failed to download %s: %v", object.Key, err)
+		// Извлекаем имя файла
+		fileName := filepath.Base(object.Key)
+		if fileName == "" || fileName == streamID {
+			continue
+		}
+
+		// Скачиваем только HLS файлы
+		if !strings.HasSuffix(fileName, ".ts") && !strings.HasSuffix(fileName, ".m3u8") {
+			continue
+		}
+
+		localPath := filepath.Join(tempDir, fileName)
+
+		// Скачиваем файл
+		err := sm.minioClient.FGetObject(ctx, sm.bucketName, object.Key, localPath, minio.GetObjectOptions{})
+		if err != nil {
+			log.Printf("❌ Failed to download %s: %v", object.Key, err)
 			continue
 		}
 
 		downloadCount++
-		log.Printf("📥 Downloaded: %s → %s", object.Key, relativePath)
-
-		// Проверить что это плейлист
-		if strings.HasSuffix(relativePath, ".m3u8") {
-			playlistFound = true
-		}
+		log.Printf("📥 Downloaded: %s (%d bytes)", fileName, object.Size)
 	}
 
 	if downloadCount == 0 {
-		os.RemoveAll(tempDir)
-		return "", fmt.Errorf("no HLS files found for stream %s in bucket %s", streamID, sm.hlsBucket)
+		os.RemoveAll(tempDir) // Очистить пустую директорию
+		return "", fmt.Errorf("no HLS files downloaded from MinIO")
 	}
 
-	if !playlistFound {
-		os.RemoveAll(tempDir)
-		return "", fmt.Errorf("no HLS playlist (.m3u8) found for stream %s", streamID)
-	}
-
-	log.Printf("✅ Downloaded %d HLS files for stream %s to %s", downloadCount, streamID, tempDir)
+	log.Printf("✅ Downloaded %d HLS files to: %s", downloadCount, tempDir)
 	return tempDir, nil
 }
 
-// ✅ Метод для получения пути к HLS плейлисту
-func (sm *StorageManager) GetHLSPlaylistPath(tempDir string) (string, error) {
-	// Поиск .m3u8 файлов в временной папке
-	playlistPaths := []string{
-		filepath.Join(tempDir, "stream.m3u8"),
-		filepath.Join(tempDir, "playlist.m3u8"),
-		filepath.Join(tempDir, "index.m3u8"),
+// ✅ НОВАЯ ФУНКЦИЯ: fallback скачивание
+func (sm *StorageManager) DownloadHLSFilesFromFallback(streamID string) (string, error) {
+	log.Printf("🔄 Using fallback method for stream: %s", streamID)
+
+	// Создаем временную директорию для fallback
+	tempDir := fmt.Sprintf("/tmp/hls_%s_fallback_%d", streamID, time.Now().Unix())
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create fallback temp dir: %v", err)
 	}
 
-	for _, path := range playlistPaths {
+	// Возможные пути к shared volume
+	possiblePaths := []string{
+		fmt.Sprintf("/shared/hls/%s", streamID),     // Docker volume mount
+		fmt.Sprintf("/app/hls/%s", streamID),        // Прямое подключение к stream-app
+		fmt.Sprintf("/tmp/stream-hls/%s", streamID), // Временная папка
+		fmt.Sprintf("/hls/%s", streamID),            // Другой возможный mount
+	}
+
+	var sharedPath string
+	var found bool
+
+	// Поиск существующей папки
+	for _, path := range possiblePaths {
 		if _, err := os.Stat(path); err == nil {
-			log.Printf("📄 Found HLS playlist: %s", path)
-			return path, nil
+			sharedPath = path
+			found = true
+			log.Printf("✅ Found HLS files at: %s", path)
+			break
 		}
 	}
 
-	// Поиск любого .m3u8 файла
-	files, err := filepath.Glob(filepath.Join(tempDir, "*.m3u8"))
-	if err == nil && len(files) > 0 {
-		log.Printf("📄 Found HLS playlist: %s", files[0])
-		return files[0], nil
+	if !found {
+		os.RemoveAll(tempDir)
+		return "", fmt.Errorf("no shared HLS directory found for stream %s", streamID)
 	}
 
-	return "", fmt.Errorf("no HLS playlist found in %s", tempDir)
-}
+	files, err := os.ReadDir(sharedPath)
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return "", fmt.Errorf("failed to read shared directory: %v", err)
+	}
 
-// ✅ Метод для очистки временных HLS файлов
-func (sm *StorageManager) CleanupHLSFiles(tempDir string) {
-	if tempDir != "" {
-		if err := os.RemoveAll(tempDir); err != nil {
-			log.Printf("⚠️ Failed to cleanup HLS temp dir %s: %v", tempDir, err)
+	copiedFiles := 0
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		fileName := file.Name()
+
+		// Пропускаем временные файлы
+		if strings.HasSuffix(fileName, ".tmp") {
+			continue
+		}
+
+		if !strings.HasSuffix(fileName, ".ts") && !strings.HasSuffix(fileName, ".m3u8") {
+			continue
+		}
+
+		srcPath := filepath.Join(sharedPath, fileName)
+		dstPath := filepath.Join(tempDir, fileName)
+
+		if err := sm.copyFile(srcPath, dstPath); err == nil {
+			copiedFiles++
+			log.Printf("📁 Copied from shared volume: %s", fileName)
 		} else {
-			log.Printf("🧹 Cleaned up HLS temp dir: %s", tempDir)
+			log.Printf("⚠️ Failed to copy %s: %v", fileName, err)
 		}
+	}
+
+	if copiedFiles == 0 {
+		os.RemoveAll(tempDir)
+		return "", fmt.Errorf("no HLS files copied from shared volume")
+	}
+
+	log.Printf("✅ Copied %d files from shared volume to: %s", copiedFiles, tempDir)
+	return tempDir, nil
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: подсчет файлов
+func (sm *StorageManager) CountHLSFiles(tempDir string) int {
+	if tempDir == "" {
+		return 0
+	}
+
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		return 0
+	}
+
+	count := 0
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		fileName := file.Name()
+		if strings.HasSuffix(fileName, ".ts") || strings.HasSuffix(fileName, ".m3u8") {
+			count++
+		}
+	}
+
+	return count
+}
+
+// ✅ ОБНОВЛЕННАЯ ФУНКЦИЯ: путь к плейлисту
+func (sm *StorageManager) GetHLSPlaylistPath(tempDir string) (string, error) {
+	// Сначала ищем стандартное имя
+	standardPath := filepath.Join(tempDir, "stream.m3u8")
+	if _, err := os.Stat(standardPath); err == nil {
+		return standardPath, nil
+	}
+
+	// Ищем любой .m3u8 файл
+	files, err := os.ReadDir(tempDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read temp directory: %v", err)
+	}
+
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".m3u8") {
+			return filepath.Join(tempDir, file.Name()), nil
+		}
+	}
+
+	return "", fmt.Errorf("no .m3u8 playlist found")
+}
+
+// ✅ ОБНОВЛЕННАЯ ФУНКЦИЯ: очистка HLS файлов
+func (sm *StorageManager) CleanupHLSFiles(tempDir string) {
+	if tempDir == "" {
+		return
+	}
+
+	if err := os.RemoveAll(tempDir); err == nil {
+		log.Printf("🧹 Cleaned up HLS temp dir: %s", tempDir)
+	} else {
+		log.Printf("⚠️ Failed to cleanup HLS temp dir %s: %v", tempDir, err)
 	}
 }
 
-func (sm *StorageManager) UploadVODFiles(streamID, mp4Path, thumbnailPath string) (VODPaths, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+// ✅ ФУНКЦИЯ ЗАГРУЗКИ VOD В MINIO
+func (sm *StorageManager) UploadVODFiles(streamID, mp4Path, thumbnailPath string) (*VODPaths, error) {
+	ctx := context.Background()
 
-	var paths VODPaths
+	// Загрузка MP4
+	mp4Key := fmt.Sprintf("vod/%s/video.mp4", streamID)
+	_, err := sm.minioClient.FPutObject(ctx, sm.vodBucket, mp4Key, mp4Path, minio.PutObjectOptions{
+		ContentType: "video/mp4",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload MP4: %v", err)
+	}
 
-	// ✅ Загрузить MP4 файл
-	if mp4Path != "" {
-		mp4ObjectName := fmt.Sprintf("vod/%s/video.mp4", streamID)
+	// Получить размер загруженного файла
+	mp4Stat, _ := os.Stat(mp4Path)
+	log.Printf("📁 Uploaded MP4: %s (size: %d bytes)", mp4Key, mp4Stat.Size())
 
-		// Проверить что файл существует
-		if _, err := os.Stat(mp4Path); os.IsNotExist(err) {
-			return paths, fmt.Errorf("MP4 file not found: %s", mp4Path)
-		}
-
-		info, err := sm.client.FPutObject(ctx, sm.bucket, mp4ObjectName, mp4Path, minio.PutObjectOptions{
-			ContentType: "video/mp4",
+	// Загрузка thumbnail если существует
+	thumbnailKey := fmt.Sprintf("vod/%s/thumbnail.jpg", streamID)
+	if _, err := os.Stat(thumbnailPath); err == nil {
+		_, err := sm.minioClient.FPutObject(ctx, sm.vodBucket, thumbnailKey, thumbnailPath, minio.PutObjectOptions{
+			ContentType: "image/jpeg",
 		})
 		if err != nil {
-			return paths, fmt.Errorf("failed to upload MP4: %w", err)
+			log.Printf("⚠️ Failed to upload thumbnail: %v", err)
+		} else {
+			thumbStat, _ := os.Stat(thumbnailPath)
+			log.Printf("📁 Uploaded thumbnail: %s (size: %d bytes)", thumbnailKey, thumbStat.Size())
 		}
-
-		paths.MP4URL = fmt.Sprintf("/%s/%s", sm.bucket, mp4ObjectName)
-		log.Printf("📁 Uploaded MP4: %s (size: %d bytes)", mp4ObjectName, info.Size)
 	}
 
-	// ✅ Загрузить thumbnail
+	return &VODPaths{
+		MP4URL:       fmt.Sprintf("/recordings/%s", mp4Key),
+		ThumbnailURL: fmt.Sprintf("/recordings/%s", thumbnailKey),
+	}, nil
+}
+
+// ✅ ФУНКЦИЯ ОЧИСТКИ ЛОКАЛЬНЫХ ФАЙЛОВ
+func (sm *StorageManager) CleanupLocalFiles(mp4Path, thumbnailPath string) {
+	if mp4Path != "" {
+		if err := os.Remove(mp4Path); err == nil {
+			log.Printf("🧹 Cleaned up local file: %s", mp4Path)
+		}
+	}
+
 	if thumbnailPath != "" {
-		if _, err := os.Stat(thumbnailPath); err == nil {
-			thumbObjectName := fmt.Sprintf("vod/%s/thumbnail.jpg", streamID)
-
-			info, err := sm.client.FPutObject(ctx, sm.bucket, thumbObjectName, thumbnailPath, minio.PutObjectOptions{
-				ContentType: "image/jpeg",
-			})
-			if err != nil {
-				log.Printf("⚠️ Failed to upload thumbnail (non-critical): %v", err)
-			} else {
-				paths.ThumbnailURL = fmt.Sprintf("/%s/%s", sm.bucket, thumbObjectName)
-				log.Printf("📁 Uploaded thumbnail: %s (size: %d bytes)", thumbObjectName, info.Size)
-			}
-		} else {
-			log.Printf("⚠️ Thumbnail file not found: %s", thumbnailPath)
+		if err := os.Remove(thumbnailPath); err == nil {
+			log.Printf("🧹 Cleaned up local file: %s", thumbnailPath)
 		}
 	}
-
-	return paths, nil
 }
 
-func (sm *StorageManager) GetPresignedURL(objectName string, expiry time.Duration) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	url, err := sm.client.PresignedGetObject(ctx, sm.bucket, objectName, expiry, nil)
+// ✅ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: копирование файлов
+func (sm *StorageManager) copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
+		return err
 	}
+	defer sourceFile.Close()
 
-	return url.String(), nil
-}
-
-func (sm *StorageManager) DeleteVODFiles(streamID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Список файлов для удаления
-	objectNames := []string{
-		fmt.Sprintf("vod/%s/video.mp4", streamID),
-		fmt.Sprintf("vod/%s/thumbnail.jpg", streamID),
-	}
-
-	for _, objectName := range objectNames {
-		if err := sm.client.RemoveObject(ctx, sm.bucket, objectName, minio.RemoveObjectOptions{}); err != nil {
-			log.Printf("⚠️ Failed to delete %s: %v", objectName, err)
-		} else {
-			log.Printf("🗑️ Deleted: %s", objectName)
-		}
-	}
-
-	return nil
-}
-
-// Утилитарная функция для очистки локальных временных файлов
-func (sm *StorageManager) CleanupLocalFiles(files ...string) {
-	for _, file := range files {
-		if file != "" {
-			if err := os.Remove(file); err != nil {
-				log.Printf("⚠️ Failed to cleanup local file %s: %v", file, err)
-			} else {
-				log.Printf("🧹 Cleaned up local file: %s", file)
-			}
-		}
-	}
-}
-
-func (sm *StorageManager) TestConnection() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	exists, err := sm.client.BucketExists(ctx, sm.bucket)
+	destFile, err := os.Create(dst)
 	if err != nil {
-		return fmt.Errorf("failed to test MinIO connection: %w", err)
+		return err
 	}
+	defer destFile.Close()
 
-	if !exists {
-		return fmt.Errorf("bucket %s does not exist", sm.bucket)
-	}
-
-	log.Printf("✅ MinIO connection test successful")
-	return nil
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }

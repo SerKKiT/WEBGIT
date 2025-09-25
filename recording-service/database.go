@@ -185,16 +185,20 @@ func (dm *DatabaseManager) UpdateRecordingStatus(streamID, status string) error 
 	return nil
 }
 
+// Обновить функцию CreateRecording для поддержки username
 func (dm *DatabaseManager) CreateRecording(recording Recording) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	query := `
         INSERT INTO recordings (
-            stream_id, user_id, title, duration_seconds, 
+            stream_id, user_id, username, title, duration_seconds, 
             file_path, thumbnail_path, file_size_bytes, status, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (stream_id) DO UPDATE SET
+            user_id = EXCLUDED.user_id,
+            username = EXCLUDED.username,
+            title = EXCLUDED.title,
             duration_seconds = EXCLUDED.duration_seconds,
             file_path = EXCLUDED.file_path,
             thumbnail_path = EXCLUDED.thumbnail_path,
@@ -204,7 +208,8 @@ func (dm *DatabaseManager) CreateRecording(recording Recording) error {
 
 	_, err := dm.pool.Exec(ctx, query,
 		recording.StreamID,
-		recording.UserID,
+		recording.UserID,   // ✅ СОХРАНЯЕМ USER_ID
+		recording.Username, // ✅ СОХРАНЯЕМ USERNAME
 		recording.Title,
 		recording.Duration,
 		recording.FilePath,
@@ -216,28 +221,70 @@ func (dm *DatabaseManager) CreateRecording(recording Recording) error {
 	)
 
 	if err != nil {
-		return fmt.Errorf("failed to create recording: %w", err)
+		return fmt.Errorf("failed to create/update recording: %w", err)
 	}
 
-	log.Printf("📊 DB: Created/Updated recording for %s (duration: %ds, size: %d bytes)",
-		recording.StreamID, recording.Duration, recording.FileSize)
+	log.Printf("📊 DB: Created/Updated recording for %s (owner: %s, user_id: %d, duration: %ds, size: %d bytes)",
+		recording.StreamID, recording.Username, recording.UserID, recording.Duration, recording.FileSize)
 
 	return nil
 }
 
+// ✅ НОВАЯ ФУНКЦИЯ: финальное обновление записи
+func (dm *DatabaseManager) UpdateRecordingComplete(recording Recording) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := `
+        UPDATE recordings SET
+            user_id = $2,
+            username = $3,
+            title = $4,
+            duration_seconds = $5,
+            file_path = $6,
+            thumbnail_path = $7,
+            file_size_bytes = $8,
+            status = $9,
+            updated_at = NOW()
+        WHERE stream_id = $1`
+
+	result, err := dm.pool.Exec(ctx, query,
+		recording.StreamID,
+		recording.UserID,   // ✅ ОБНОВЛЯЕМ USER_ID
+		recording.Username, // ✅ ОБНОВЛЯЕМ USERNAME
+		recording.Title,
+		recording.Duration,
+		recording.FilePath,
+		recording.ThumbnailPath,
+		recording.FileSize,
+		recording.Status,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to update recording complete: %w", err)
+	}
+
+	rowsAffected := result.RowsAffected()
+	log.Printf("📊 DB: Updated recording complete for %s (owner: %s, rows affected: %d)",
+		recording.StreamID, recording.Username, rowsAffected)
+
+	return nil
+}
+
+// Обновить GetRecording для поддержки username
 func (dm *DatabaseManager) GetRecording(streamID string) (*Recording, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	query := `
-        SELECT id, stream_id, user_id, title, duration_seconds,
+        SELECT id, stream_id, user_id, username, title, duration_seconds,
                file_path, thumbnail_path, file_size_bytes, status, created_at, updated_at
         FROM recordings 
         WHERE stream_id = $1`
 
 	var r Recording
 	err := dm.pool.QueryRow(ctx, query, streamID).Scan(
-		&r.ID, &r.StreamID, &r.UserID, &r.Title, &r.Duration,
+		&r.ID, &r.StreamID, &r.UserID, &r.Username, &r.Title, &r.Duration, // ✅ ДОБАВЛЕН USERNAME
 		&r.FilePath, &r.ThumbnailPath, &r.FileSize, &r.Status,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
@@ -249,12 +296,13 @@ func (dm *DatabaseManager) GetRecording(streamID string) (*Recording, error) {
 	return &r, nil
 }
 
+// Обновить ListRecordings для поддержки username
 func (dm *DatabaseManager) ListRecordings(limit, offset int) ([]Recording, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	query := `
-        SELECT id, stream_id, user_id, title, duration_seconds,
+        SELECT id, stream_id, user_id, username, title, duration_seconds,
                file_path, thumbnail_path, file_size_bytes, status, created_at, updated_at
         FROM recordings 
         ORDER BY created_at DESC 
@@ -270,7 +318,7 @@ func (dm *DatabaseManager) ListRecordings(limit, offset int) ([]Recording, error
 	for rows.Next() {
 		var r Recording
 		err := rows.Scan(
-			&r.ID, &r.StreamID, &r.UserID, &r.Title, &r.Duration,
+			&r.ID, &r.StreamID, &r.UserID, &r.Username, &r.Title, &r.Duration, // ✅ ДОБАВЛЕН USERNAME
 			&r.FilePath, &r.ThumbnailPath, &r.FileSize, &r.Status,
 			&r.CreatedAt, &r.UpdatedAt,
 		)
@@ -280,6 +328,44 @@ func (dm *DatabaseManager) ListRecordings(limit, offset int) ([]Recording, error
 		recordings = append(recordings, r)
 	}
 
+	log.Printf("📊 DB: Listed %d recordings (limit: %d, offset: %d)", len(recordings), limit, offset)
+	return recordings, nil
+}
+
+// ✅ НОВАЯ ФУНКЦИЯ: получение записей пользователя
+func (dm *DatabaseManager) GetUserRecordings(userID int, limit, offset int) ([]Recording, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := `
+        SELECT id, stream_id, user_id, username, title, duration_seconds,
+               file_path, thumbnail_path, file_size_bytes, status, created_at, updated_at
+        FROM recordings 
+        WHERE user_id = $1
+        ORDER BY created_at DESC 
+        LIMIT $2 OFFSET $3`
+
+	rows, err := dm.pool.Query(ctx, query, userID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user recordings: %w", err)
+	}
+	defer rows.Close()
+
+	var recordings []Recording
+	for rows.Next() {
+		var r Recording
+		err := rows.Scan(
+			&r.ID, &r.StreamID, &r.UserID, &r.Username, &r.Title, &r.Duration,
+			&r.FilePath, &r.ThumbnailPath, &r.FileSize, &r.Status,
+			&r.CreatedAt, &r.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan user recording: %w", err)
+		}
+		recordings = append(recordings, r)
+	}
+
+	log.Printf("📊 DB: Listed %d recordings for user_id %d", len(recordings), userID)
 	return recordings, nil
 }
 

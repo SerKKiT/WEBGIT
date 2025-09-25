@@ -18,10 +18,13 @@ type Message struct {
 	Text string `json:"text,omitempty"`
 }
 
+// Обновленная структура Task с авторизацией
 type Task struct {
 	ID       int       `json:"id,omitempty"`
 	StreamID string    `json:"stream_id"`
 	Name     string    `json:"name"`
+	UserID   int       `json:"user_id,omitempty"`  // ✅ НОВОЕ ПОЛЕ
+	Username string    `json:"username,omitempty"` // ✅ НОВОЕ ПОЛЕ
 	Created  time.Time `json:"created,omitempty"`
 	Updated  time.Time `json:"updated,omitempty"`
 	Status   string    `json:"status"`
@@ -47,8 +50,23 @@ func generateStreamID() (string, error) {
 
 // Хэндлеры для задач (tasks)
 func GetTasksHandler(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(context.Background(), "SELECT id, streamid, name, created, updated, status FROM Tasks")
+	// ✅ ДОБАВЛЕНА ПОДДЕРЖКА ФИЛЬТРАЦИИ ПО STREAM_ID
+	streamIDFilter := r.URL.Query().Get("stream_id")
+
+	var query string
+	var args []interface{}
+
+	if streamIDFilter != "" {
+		query = "SELECT id, streamid, name, user_id, username, created, updated, status FROM Tasks WHERE streamid = $1"
+		args = append(args, streamIDFilter)
+		log.Printf("📋 Filtering tasks by stream_id: %s", streamIDFilter)
+	} else {
+		query = "SELECT id, streamid, name, user_id, username, created, updated, status FROM Tasks ORDER BY created DESC"
+	}
+
+	rows, err := db.Query(context.Background(), query, args...)
 	if err != nil {
+		log.Printf("❌ Failed to fetch tasks: %v", err)
 		http.Error(w, "Failed to fetch tasks", http.StatusInternalServerError)
 		return
 	}
@@ -57,12 +75,18 @@ func GetTasksHandler(w http.ResponseWriter, r *http.Request) {
 	var tasks []Task
 	for rows.Next() {
 		var t Task
-		if err := rows.Scan(&t.ID, &t.StreamID, &t.Name, &t.Created, &t.Updated, &t.Status); err != nil {
+		if err := rows.Scan(&t.ID, &t.StreamID, &t.Name, &t.UserID, &t.Username, &t.Created, &t.Updated, &t.Status); err != nil {
+			log.Printf("❌ Error scanning task: %v", err)
 			http.Error(w, "Error scanning task", http.StatusInternalServerError)
 			return
 		}
 		tasks = append(tasks, t)
 	}
+
+	if streamIDFilter != "" {
+		log.Printf("📊 Found %d tasks for stream_id: %s", len(tasks), streamIDFilter)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(tasks)
 }
@@ -246,11 +270,15 @@ func isValidStatus(s string) bool {
 	}
 }
 
-func notifyStreamApp(streamID, status string, taskID int) error {
+// ✅ ОБНОВЛЕННАЯ ФУНКЦИЯ: передача информации о пользователе в stream-app
+func notifyStreamAppWithUserInfo(streamID, status string, taskID int, userID int, username, title string) error {
 	notification := map[string]interface{}{
 		"stream_id": streamID,
 		"status":    status,
 		"task_id":   taskID,
+		"user_id":   userID,   // ✅ ДОБАВЛЕНО
+		"username":  username, // ✅ ДОБАВЛЕНО
+		"title":     title,    // ✅ ДОБАВЛЕНО
 	}
 
 	jsonData, err := json.Marshal(notification)
@@ -268,7 +296,14 @@ func notifyStreamApp(streamID, status string, taskID int) error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("stream-app returned status %s", resp.Status)
 	}
+
+	log.Printf("✅ Notified stream-app: %s -> %s (user: %s, id: %d)", streamID, status, username, userID)
 	return nil
+}
+
+// Обновить старую функцию для совместимости
+func notifyStreamApp(streamID, status string, taskID int) error {
+	return notifyStreamAppWithUserInfo(streamID, status, taskID, 0, "legacy", fmt.Sprintf("Legacy task %d", taskID))
 }
 
 // Обновление статуса задачи по StreamID (для уведомлений от stream-app)

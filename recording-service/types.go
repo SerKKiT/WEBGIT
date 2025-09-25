@@ -2,10 +2,11 @@ package main
 
 import "time"
 
-// RecordingTask структура задачи из Kafka
+// RecordingTask структура задачи из Kafka (обновленная)
 type RecordingTask struct {
 	StreamID     string    `json:"stream_id"`
-	UserID       int       `json:"user_id,omitempty"`
+	UserID       int       `json:"user_id"`  // ✅ ОБЯЗАТЕЛЬНОЕ ПОЛЕ (убрали omitempty)
+	Username     string    `json:"username"` // ✅ НОВОЕ ПОЛЕ
 	Title        string    `json:"title"`
 	Action       string    `json:"action"`
 	HLSPath      string    `json:"hls_path"`
@@ -18,11 +19,12 @@ type RecordingTask struct {
 	Timestamp    time.Time `json:"timestamp"`
 }
 
-// Recording структура записи в БД
+// Recording структура записи в БД (обновленная)
 type Recording struct {
 	ID            int       `json:"id"`
 	StreamID      string    `json:"stream_id"`
-	UserID        int       `json:"user_id"`
+	UserID        int       `json:"user_id"`  // ✅ ОБЯЗАТЕЛЬНОЕ ПОЛЕ
+	Username      string    `json:"username"` // ✅ НОВОЕ ПОЛЕ
 	Title         string    `json:"title"`
 	Duration      int       `json:"duration_seconds"`
 	FilePath      string    `json:"file_path"`
@@ -33,7 +35,7 @@ type Recording struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// ProcessingResult результат обработки
+// ProcessingResult результат обработки (без изменений)
 type ProcessingResult struct {
 	Success       bool
 	MP4Path       string

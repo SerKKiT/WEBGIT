@@ -112,10 +112,15 @@ services:
     environment:
       - PORT=8080
       - DATABASE_URL=postgres://postgres:example@postgres:5432/appdb?sslmode=disable
+      # ✅ НОВЫЕ: Auth интеграция
+      - AUTH_SERVICE_URL=http://auth-service:8082
+      - SERVICE_API_KEY=dev-service-api-key-for-local-testing
     networks:
       - app-network
     depends_on:
       postgres:
+        condition: service_healthy
+      auth-service:  # ✅ НОВАЯ ЗАВИСИМОСТЬ
         condition: service_healthy
     restart: unless-stopped
 
