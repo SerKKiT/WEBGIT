@@ -1,113 +1,90 @@
-Вот тестовые curl команды для проверки всех endpoints вашего веб-сервиса:
+# 🚀 **COMPLETE CYCLE - SEQUENTIAL CURL COMMANDS**
 
-## Тестирование основных endpoints для задач
+Here's the complete sequential list of curl commands for a full platform test cycle:
 
-### 1. Получить все задачи
+## **1. SYSTEM HEALTH VERIFICATION**
 ```bash
-curl -X GET http://localhost:8080/tasks
+curl -X GET "http://localhost/health"
+curl -X GET "http://localhost/api/auth/health"
+curl -X GET "http://localhost/api/main/health"
+curl -X GET "http://localhost/api/stream/health"
+curl -X GET "http://localhost/api/vod/health"
 ```
 
-### 2. Создать новую задачу
+## **2. USER REGISTRATION**
 ```bash
-curl -X POST http://localhost:8080/tasks -H "Content-Type: application/json" -d "{\"name\":\"Test Task 1\"}"
+curl -X POST "http://localhost/api/auth/register" -H "Content-Type: application/json" -d "{\"username\":\"testuser$(date +%s)\",\"email\":\"test$(date +%s)@test.local\",\"password\":\"test123456\",\"role\":\"streamer\"}"
 ```
 
+## **3. TOKEN VALIDATION**
 ```bash
-curl -X POST http://localhost:8080/tasks -H "Content-Type: application/json" -d "{\"name\":\"Test Task 2\"}"
+# Extract token from registration response and set it
+export TOKEN="your_extracted_token_here"
+curl -X POST "http://localhost/api/auth/validate-token" -H "Content-Type: application/json" -d "{\"token\":\"$TOKEN\"}"
 ```
 
-### 3. Обновить статус задачи (замените {id} на реальный ID)
+## **4. STREAM CREATION**
 ```bash
-curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"waiting\"}"
+curl -X POST "http://localhost/api/streams" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"name\":\"Complete Test Stream\",\"title\":\"Full Cycle Test - $(date)\"}"
 ```
 
+## **5. STREAM START**
 ```bash
-curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"running\"}"        //используется только приложением внутри!!!!
+# Extract STREAM_ID from creation response
+export STREAM_ID="your_extracted_stream_id"
+curl -X POST "http://localhost/api/streams/$STREAM_ID/start" -H "Authorization: Bearer $TOKEN"
 ```
 
+## **6. TASK CREATION**
 ```bash
-curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"stopped\"}"
+curl -X POST "http://localhost/tasks" -H "Content-Type: application/json" -d "{\"name\":\"Test Task - $(date +%s)\",\"stream_id\":\"$STREAM_ID\",\"status\":\"pending\"}"
 ```
 
+## **7. HLS PLAYLIST CHECK**
 ```bash
-curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"error\"}"        //используется только приложением внутри!!!!
+curl -X GET "http://localhost/hls/$STREAM_ID/stream.m3u8"
 ```
 
-### 4. Удалить задачу
+## **8. STREAM STOP**
 ```bash
-curl -X DELETE "http://localhost:8080/tasks?id=1"
+curl -X POST "http://localhost/api/streams/$STREAM_ID/stop" -H "Authorization: Bearer $TOKEN"
 ```
 
-## Тестирование специальных endpoints
-
-### 5. Получить активные задачи
+## **9. VOD PROCESSING CHECK**
 ```bash
-curl -X GET http://localhost:8080/tasks/active
+# Wait 60 seconds for processing
+sleep 60
+curl -X GET "http://localhost/api/recordings/$STREAM_ID"
 ```
 
-### 6. Обновить статус по stream_id (эмуляция уведомления от stream-app)
+## **10. THUMBNAIL ACCESS**
 ```bash
-curl -X PUT http://localhost:8080/tasks/update_status_by_stream -H "Content-Type: application/json" -d "{\"stream_id\":\"abc-def-ghi-jkl\",\"status\":\"running\"}"             //используется только приложением внутри!!!!
+curl -X GET "http://localhost/api/recordings/$STREAM_ID/thumbnail" -o "test_thumbnail.jpg"
 ```
 
-### 7. Проверить статус миграций
+## **11. CLEANUP OPERATIONS**
 ```bash
-curl -X GET http://localhost:8080/debug/migrations
+# Clean up tasks (correct query parameter format)
+curl -X DELETE "http://localhost/tasks?id=1"
+curl -X DELETE "http://localhost/tasks?id=2"
+curl -X DELETE "http://localhost/tasks?id=3"
+
+# Update task status by stream
+curl -X PUT "http://localhost/tasks/update_status_by_stream" -H "Content-Type: application/json" -d "{\"stream_id\":\"$STREAM_ID\",\"status\":\"deleted\"}"
+
+# Systematic cleanup (IDs 1-20)
+for i in {1..20}; do curl -X DELETE "http://localhost/tasks?id=$i"; done
 ```
 
-## Тестирование ошибочных сценариев
-
-### Попытка создать задачу без имени
+## **12. FINAL VERIFICATION**
 ```bash
-curl -X POST http://localhost:8080/tasks -H "Content-Type: application/json" -d "{}"
+curl -X GET "http://localhost/tasks"
+curl -X GET "http://localhost/api/streams/my" -H "Authorization: Bearer $TOKEN"
 ```
 
-### Попытка обновить задачу с невалидным статусом
+## **COMPLETE ONE-LINER SEQUENCE:**
 ```bash
-curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"invalid_status\"}"
+curl -X GET "http://localhost/health" && curl -X POST "http://localhost/api/auth/register" -H "Content-Type: application/json" -d "{\"username\":\"test$(date +%s)\",\"email\":\"test$(date +%s)@test.local\",\"password\":\"test123456\",\"role\":\"streamer\"}" > reg.json && export TOKEN=$(cat reg.json | grep -o '"access_token":"[^"]*' | cut -d'"' -f4) && curl -X POST "http://localhost/api/streams" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"name\":\"Quick Test\",\"title\":\"One Liner Test\"}" > stream.json && export STREAM_ID=$(cat stream.json | grep -o '"stream_id":"[^"]*' | cut -d'"' -f4) && curl -X POST "http://localhost/api/streams/$STREAM_ID/start" -H "Authorization: Bearer $TOKEN" && sleep 10 && curl -X POST "http://localhost/api/streams/$STREAM_ID/stop" -H "Authorization: Bearer $TOKEN" && sleep 60 && curl -X GET "http://localhost/api/recordings/$STREAM_ID" && for i in {1..10}; do curl -X DELETE "http://localhost/tasks?id=$i" 2>/dev/null; done
 ```
 
-### Попытка обновить несуществующую задачу
-```bash
-curl -X PUT "http://localhost:8080/tasks?id=9999" -H "Content-Type: application/json" -d "{\"status\":\"stopped\"}"
-```
-
-### Попытка удалить несуществующую задачу
-```bash
-curl -X DELETE "http://localhost:8080/tasks?id=9999"
-```
-
-### Попытка использовать неподдерживаемый HTTP метод
-```bash
-curl -X PATCH http://localhost:8080/tasks
-```
-
-## Полный сценарий тестирования
-
-```bash
-echo "=== Создаем тестовые задачи ===" && curl -X POST http://localhost:8080/tasks -H "Content-Type: application/json" -d "{\"name\":\"Task 1\"}" && echo "" && curl -X POST http://localhost:8080/tasks -H "Content-Type: application/json" -d "{\"name\":\"Task 2\"}" && echo ""
-```
-
-```bash
-echo "=== Получаем все задачи ===" && curl -X GET http://localhost:8080/tasks && echo ""
-```
-
-```bash
-echo "=== Обновляем статус первой задачи ===" && curl -X PUT "http://localhost:8080/tasks?id=1" -H "Content-Type: application/json" -d "{\"status\":\"waiting\"}" && echo ""
-```
-
-```bash
-echo "=== Получаем активные задачи ===" && curl -X GET http://localhost:8080/tasks/active && echo ""
-```
-
-```bash
-echo "=== Проверяем миграции ===" && curl -X GET http://localhost:8080/debug/migrations && echo ""
-```
-
-## Примечания
-
-- Замените `localhost:8080` на актуальный адрес вашего сервера
-- ID задач в командах обновления и удаления замените на реальные ID из ответов создания задач
-- Все команды форматированы для Windows и являются однострочными
-- Stream_id в тестах указан как пример - используйте реальные значения из созданных задач
-- Команды тестируют как успешные сценарии, так и обработку ошибок
+This sequential command set provides a complete test cycle covering health checks, user management, streaming operations, VOD processing, and cleanup - everything needed to verify your Enterprise Streaming Platform is production-ready.
