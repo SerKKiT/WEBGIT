@@ -123,6 +123,12 @@ services:
       auth-service:  # ✅ НОВАЯ ЗАВИСИМОСТЬ
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8080 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
   stream-app:
     build: ./stream-app
@@ -184,6 +190,8 @@ services:
       - "80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/proxy_params:/etc/nginx/proxy_params:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro  # Статические файлы
     depends_on:
       - main-app
       - stream-app

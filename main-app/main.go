@@ -126,6 +126,8 @@ func setupRoutes() {
 	protected.HandleFunc("/{streamId}/start", StartStreamHandler).Methods("POST")
 	protected.HandleFunc("/{streamId}/stop", StopStreamHandler).Methods("POST")
 
+	// ✅ ДОБАВИТЬ ЭТОТ ENDPOINT:
+	protected.HandleFunc("/{streamId}", GetStreamByIdHandler).Methods("GET")
 	// Список моих стримов
 	protected.HandleFunc("/my", MyStreamsHandler).Methods("GET")
 
@@ -224,4 +226,74 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// ✅ НОВЫЙ HANDLER: Получение информации о конкретном стриме
+func GetStreamByIdHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	streamId := vars["streamId"]
+
+	if streamId == "" {
+		http.Error(w, "Stream ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем информацию о пользователе из контекста (установлено middleware)
+	userInfo, ok := r.Context().Value("user").(map[string]interface{})
+	if !ok {
+		http.Error(w, "User info not found", http.StatusInternalServerError)
+		return
+	}
+
+	userId, ok := userInfo["user_id"].(float64)
+	if !ok {
+		http.Error(w, "Invalid user ID", http.StatusInternalServerError)
+		return
+	}
+
+	// SQL запрос для получения стрима
+	query := `
+        SELECT id, stream_id, name, title, user_id, username, status, created_at
+        FROM streams 
+        WHERE stream_id = $1 AND user_id = $2
+    `
+
+	var stream struct {
+		ID        int       `json:"id"`
+		StreamID  string    `json:"stream_id"`
+		Name      string    `json:"name"`
+		Title     string    `json:"title"`
+		UserID    int       `json:"user_id"`
+		Username  string    `json:"username"`
+		Status    string    `json:"status"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+
+	err := db.QueryRow(context.Background(), query, streamId, int(userId)).Scan(
+		&stream.ID,
+		&stream.StreamID,
+		&stream.Name,
+		&stream.Title,
+		&stream.UserID,
+		&stream.Username,
+		&stream.Status,
+		&stream.CreatedAt,
+	)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			http.Error(w, "Stream not found or access denied", http.StatusNotFound)
+			return
+		}
+		log.Printf("Database error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(stream); err != nil {
+		log.Printf("JSON encoding error: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
 }
